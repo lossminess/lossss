@@ -1,0 +1,1008 @@
+--[[
+    Кастомный GUI для управления Waypoints, Walkspeed и MountainClimber.
+    Уменьшенная версия – все размеры и отступы разделены на 3.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = cloneref(game:GetService("VirtualUser"))
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local root = character:WaitForChild("HumanoidRootPart")
+local humanoid = character:WaitForChild("Humanoid")
+
+-- ========== Утилиты ==========
+local function notify(title, content, duration)
+    duration = duration or 3
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "Notification"
+    gui.Parent = player.PlayerGui
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 300, 0, 60)      -- было 300x60
+    frame.Position = UDim2.new(1, -107, 0, 3)  -- -320 -> -107, 10 -> 3
+    frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    frame.BackgroundTransparency = 0.1
+    frame.BorderSizePixel = 0
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -4, 0, 7)   -- -10 -> -4, 20 -> 7
+    titleLabel.Position = UDim2.new(0, 2, 0, 2) -- 5 -> 2
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = title
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextSize = 8                    -- 16 -> 8
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = frame
+    local contentLabel = Instance.new("TextLabel")
+    contentLabel.Size = UDim2.new(1, -4, 0, 10) -- -10 -> -4, 30 -> 10
+    contentLabel.Position = UDim2.new(0, 2, 0, 9) -- 5 -> 2, 25 -> 9
+    contentLabel.BackgroundTransparency = 1
+    contentLabel.Text = content
+    contentLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    contentLabel.TextSize = 8                  -- 14 -> 8
+    contentLabel.Font = Enum.Font.Gotham
+    contentLabel.TextXAlignment = Enum.TextXAlignment.Left
+    contentLabel.Parent = frame
+    frame.Parent = gui
+    task.delay(duration, function()
+        gui:Destroy()
+    end)
+end
+
+-- ========== Переменные Waypoints ==========
+local waypoints = {}
+local waypointParts = {}
+local running = false
+local currentWaypointIndex = 1
+local tweenSpeed = 16
+local autoSpawnWaypoints = false
+local spawnInterval = 0.5
+local autoSpawnThread = nil
+local autoWalkThread = nil
+local managedWaypointIndex = nil
+local managedWaypointColor = Color3.fromRGB(0, 255, 0)
+local normalWaypointColor = Color3.fromRGB(255, 0, 0)
+local defaultWaypointColor = Color3.fromRGB(255, 0, 0)
+local currentTween = nil
+local waitingInAir = false
+local maxDisplayPoints = 200
+
+-- ========== Walkspeed переменные ==========
+local walkspeedEnabled = false
+local walkspeedValue = 16
+local mountainClimberEnabled = false
+local wsCon, msaCon
+
+-- ========== Функции Waypoints ==========
+local function createWaypointVisual(position, index, waitTime, isManaged)
+    local part = Instance.new("Part")
+    part.Name = "Waypoint_" .. index
+    part.Shape = Enum.PartType.Ball
+    part.Size = Vector3.new(1.2, 1.2, 1.2)
+    part.Position = position
+    part.Anchored = true
+    part.CanCollide = false
+    part.Material = Enum.Material.ForceField
+    part.Transparency = 0.2
+    if isManaged then
+        part.Color = managedWaypointColor
+        local billboard = Instance.new("BillboardGui")
+        billboard.Name = "WaypointInfo"
+        billboard.Size = UDim2.new(0, 80, 0, 30)
+        billboard.AlwaysOnTop = true
+        billboard.MaxDistance = 150
+        billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+        billboard.Parent = part
+        local textLabel = Instance.new("TextLabel")
+        textLabel.Name = "Text"
+        textLabel.Size = UDim2.new(1, 0, 1, 0)
+        textLabel.BackgroundTransparency = 1
+        textLabel.TextColor3 = Color3.new(1, 1, 1)
+        textLabel.TextStrokeTransparency = 0.2
+        textLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+        textLabel.Font = Enum.Font.SourceSansBold
+        textLabel.TextSize = 14
+        textLabel.Text = index .. (waitTime and waitTime > 0 and "\n⏱" .. waitTime .. "s" or "")
+        textLabel.Parent = billboard
+    else
+        part.Color = normalWaypointColor
+    end
+    part.Parent = workspace
+    return part
+end
+
+local function updateWaypointVisuals()
+    for _, part in pairs(waypointParts) do
+        if part and part.Parent then
+            part:Destroy()
+        end
+    end
+    waypointParts = {}
+    local total = #waypoints
+    local displayCount = math.min(total, maxDisplayPoints)
+    if managedWaypointIndex and managedWaypointIndex > displayCount then
+        displayCount = managedWaypointIndex
+    end
+    for i = 1, math.min(total, displayCount) do
+        local waypoint = waypoints[i]
+        local isManaged = (i == managedWaypointIndex)
+        local part = createWaypointVisual(waypoint.position, i, waypoint.waitTime, isManaged)
+        table.insert(waypointParts, part)
+    end
+end
+
+local function addWaypoint()
+    local position = root.Position
+    if managedWaypointIndex then
+        waypoints[managedWaypointIndex].position = position
+        unmanageWaypoint()
+        updateWaypointVisuals()
+        notify("Waypoint", "Managed waypoint replaced!")
+        return
+    else
+        table.insert(waypoints, { position = position, waitTime = 0 })
+        updateWaypointVisuals()
+        notify("Waypoint", "New waypoint added!")
+    end
+end
+
+local function removeAllWaypoints()
+    running = false
+    waitingInAir = false
+    autoSpawnWaypoints = false
+    managedWaypointIndex = nil
+    normalWaypointColor = defaultWaypointColor
+    if autoWalkThread then
+        coroutine.close(autoWalkThread)
+        autoWalkThread = nil
+    end
+    if autoSpawnThread then
+        coroutine.close(autoSpawnThread)
+        autoSpawnThread = nil
+    end
+    if currentTween then
+        currentTween:Cancel()
+        currentTween = nil
+    end
+    waypoints = {}
+    updateWaypointVisuals()
+    currentWaypointIndex = 1
+    if humanoid then
+        humanoid:ChangeState(Enum.HumanoidStateType.Running)
+    end
+    if autoTweenToggle then autoTweenToggle.Text = "OFF" end
+    if autoSpawnToggle then autoSpawnToggle.Text = "OFF" end
+    notify("Waypoint", "All waypoints removed")
+end
+
+local function removeLastWaypoint()
+    if #waypoints > 0 then
+        if managedWaypointIndex == #waypoints then
+            unmanageWaypoint()
+        end
+        table.remove(waypoints, #waypoints)
+        updateWaypointVisuals()
+        notify("Waypoint", "Last waypoint removed")
+    end
+end
+
+local function generateRandomWaypoints()
+    removeAllWaypoints()
+    local basePos = root.Position
+    for i = 1, 20 do
+        local randomOffset = Vector3.new(
+            math.random(-50, 50),
+            math.random(-10, 20),
+            math.random(-50, 50)
+        )
+        local newPos = Vector3.new(
+            basePos.X + randomOffset.X,
+            basePos.Y + randomOffset.Y,
+            basePos.Z + randomOffset.Z
+        )
+        table.insert(waypoints, {
+            position = newPos,
+            waitTime = 0
+        })
+    end
+    updateWaypointVisuals()
+    notify("Waypoint", "Generated 20 random waypoints")
+end
+
+local function manageWaypoint(index)
+    if index < 1 or index > #waypoints then
+        notify("Waypoint", "Waypoint #" .. index .. " doesn't exist!")
+        return false
+    end
+    if managedWaypointIndex then
+        normalWaypointColor = defaultWaypointColor
+        managedWaypointIndex = nil
+    end
+    managedWaypointIndex = index
+    normalWaypointColor = Color3.fromRGB(255, 0, 0)
+    updateWaypointVisuals()
+    notify("Waypoint", "Managing waypoint #" .. index .. " (green)")
+    return true
+end
+
+local function unmanageWaypoint()
+    if not managedWaypointIndex then
+        notify("Waypoint", "No waypoint being managed")
+        return false
+    end
+    normalWaypointColor = defaultWaypointColor
+    managedWaypointIndex = nil
+    updateWaypointVisuals()
+    notify("Waypoint", "Stopped managing waypoint")
+    return true
+end
+
+local function setWaitTime(index, waitTime)
+    if waypoints[index] then
+        waypoints[index].waitTime = tonumber(waitTime) or 0
+        updateWaypointVisuals()
+        notify("Waypoint", "Wait time set for waypoint #" .. index)
+    else
+        notify("Waypoint", "Waypoint #" .. index .. " not found")
+    end
+end
+
+local function loadWaypointsFromString(input)
+    task.spawn(function()
+        local data = nil
+        local loaded = false
+        local success, jsonData = pcall(function()
+            return HttpService:JSONDecode(input)
+        end)
+        if success and type(jsonData) == "table" and #jsonData > 0 then
+            data = jsonData
+            loaded = true
+        end
+        if not loaded then
+            local temp = {}
+            local pattern = "Vector3%.new%s*%(%s*([%-%d%.]+)%s*,%s*([%-%d%.]+)%s*,%s*([%-%d%.]+)%s*%)"
+            local waitPattern = "waitTime%s*=%s*([%-%d%.]+)"
+            local lines = {}
+            for line in input:gmatch("[^\n\r]+") do
+                table.insert(lines, line)
+            end
+            for _, line in ipairs(lines) do
+                local x, y, z = line:match(pattern)
+                if x and y and z then
+                    local wait = 0
+                    local w = line:match(waitPattern)
+                    if w then
+                        wait = tonumber(w) or 0
+                    else
+                        local commentWait = line:match("wait%s*[:=]%s*([%-%d%.]+)")
+                        if commentWait then
+                            wait = tonumber(commentWait) or 0
+                        end
+                    end
+                    table.insert(temp, {
+                        position = Vector3.new(tonumber(x), tonumber(y), tonumber(z)),
+                        waitTime = wait
+                    })
+                end
+            end
+            if #temp > 0 then
+                data = temp
+                loaded = true
+            end
+        end
+        if not loaded then
+            local nums = {}
+            for num in input:gmatch("[%-%d%.]+") do
+                table.insert(nums, tonumber(num))
+            end
+            if #nums >= 3 then
+                local temp = {}
+                for i = 1, #nums - 2, 3 do
+                    local x, y, z = nums[i], nums[i+1], nums[i+2]
+                    if x and y and z then
+                        table.insert(temp, {
+                            position = Vector3.new(x, y, z),
+                            waitTime = 0
+                        })
+                    end
+                end
+                if #temp > 0 then
+                    data = temp
+                    loaded = true
+                end
+            end
+        end
+        if loaded and data and #data > 0 then
+            running = false
+            waitingInAir = false
+            autoSpawnWaypoints = false
+            managedWaypointIndex = nil
+            normalWaypointColor = defaultWaypointColor
+            if autoWalkThread then
+                coroutine.close(autoWalkThread)
+                autoWalkThread = nil
+            end
+            if autoSpawnThread then
+                coroutine.close(autoSpawnThread)
+                autoSpawnThread = nil
+            end
+            if currentTween then
+                currentTween:Cancel()
+                currentTween = nil
+            end
+            waypoints = {}
+            for _, wp in ipairs(data) do
+                local pos = wp.position or (wp.x and wp.y and wp.z and Vector3.new(wp.x, wp.y, wp.z))
+                if pos then
+                    table.insert(waypoints, {
+                        position = pos,
+                        waitTime = wp.wait or wp.waitTime or 0
+                    })
+                end
+            end
+            currentWaypointIndex = 1
+            if humanoid then
+                humanoid:ChangeState(Enum.HumanoidStateType.Running)
+            end
+            if autoTweenToggle then autoTweenToggle.Text = "OFF" end
+            if autoSpawnToggle then autoSpawnToggle.Text = "OFF" end
+            updateWaypointVisuals()
+            notify("Waypoint", "Loaded " .. #waypoints .. " waypoints")
+        else
+            notify("Waypoint", "Invalid data format")
+        end
+    end)
+end
+
+local function copyWaypoints()
+    if #waypoints == 0 then
+        notify("Waypoint", "No waypoints to copy")
+        return
+    end
+    local waypointData = {}
+    for i, waypoint in ipairs(waypoints) do
+        table.insert(waypointData, {
+            x = waypoint.position.X,
+            y = waypoint.position.Y,
+            z = waypoint.position.Z,
+            wait = waypoint.waitTime or 0
+        })
+    end
+    local json = HttpService:JSONEncode(waypointData)
+    setclipboard(json)
+    notify("Waypoint", "Copied " .. #waypoints .. " waypoints to clipboard")
+end
+
+local function goToWaypointTween(index)
+    if not running or #waypoints == 0 or not waypoints[index] then return false end
+    local waypoint = waypoints[index]
+    local targetPos = waypoint.position
+    local gyro = root:FindFirstChild("WaypointGyro")
+    if not gyro then
+        gyro = Instance.new("BodyGyro")
+        gyro.Name = "WaypointGyro"
+        gyro.Parent = root
+    end
+    gyro.P = 20000
+    gyro.D = 500
+    gyro.MaxTorque = Vector3.new(400000, 400000, 400000)
+    humanoid.AutoRotate = false
+    humanoid:ChangeState(Enum.HumanoidStateType.RunningNoPhysics)
+    local reached = false
+    while running and not reached do
+        local currentPos = root.Position
+        local distance = (targetPos - currentPos).Magnitude
+        if distance < 0.5 then 
+            reached = true
+            break
+        end
+        local deltaTime = task.wait()
+        local direction = (targetPos - currentPos).Unit
+        local moveStep = direction * (tweenSpeed * deltaTime)
+        if distance > moveStep.Magnitude then
+            root.CFrame = root.CFrame + moveStep
+        else
+            root.CFrame = CFrame.new(targetPos)
+            reached = true
+        end
+        local lookTarget = Vector3.new(targetPos.X, root.Position.Y, targetPos.Z)
+        if (lookTarget - root.Position).Magnitude > 0.1 then
+            gyro.CFrame = CFrame.new(root.Position, lookTarget)
+        end
+        root.Velocity = Vector3.new(0, 0, 0)
+    end
+    return reached
+end
+
+local function goToWaypoint(index)
+    if not running or #waypoints == 0 or not waypoints[index] then return end
+    local waypoint = waypoints[index]
+    local reached = goToWaypointTween(index)
+    if running and reached then
+        if waypoint.waitTime and waypoint.waitTime > 0 then
+            root.CFrame = CFrame.new(waypoint.position)
+            root.Velocity = Vector3.new(0,0,0)
+            root.Anchored = true
+            local startWait = tick()
+            while tick() - startWait < waypoint.waitTime and running do
+                task.wait(0.1)
+            end
+            root.Anchored = false
+        end
+    end
+end
+
+local function startAutoWalk()
+    if running or #waypoints == 0 then return end
+    running = true
+    if autoTweenToggle then autoTweenToggle.Text = "ON" end
+    autoWalkThread = coroutine.create(function()
+        while running and #waypoints > 0 do
+            for i = 1, #waypoints do
+                if not running or #waypoints == 0 then break end
+                currentWaypointIndex = i
+                if not root:FindFirstChild("WaypointGyro") then
+                    local g = Instance.new("BodyGyro")
+                    g.Name = "WaypointGyro"
+                    g.P = 10000
+                    g.MaxTorque = Vector3.new(400000, 400000, 400000)
+                    g.CFrame = root.CFrame
+                    g.Parent = root
+                end
+                goToWaypoint(i)
+            end
+            task.wait()
+        end
+        stopAutoWalk()
+    end)
+    coroutine.resume(autoWalkThread)
+end
+
+local function stopAutoWalk()
+    running = false
+    waitingInAir = false
+    if root then
+        root.Anchored = false
+    end
+    if root:FindFirstChild("WaypointGyro") then
+        root.WaypointGyro:Destroy()
+    end
+    humanoid.AutoRotate = true
+    if autoWalkThread then
+        coroutine.close(autoWalkThread)
+        autoWalkThread = nil
+    end
+    if currentTween then
+        currentTween:Cancel()
+        currentTween = nil
+    end
+    if humanoid then
+        humanoid:ChangeState(Enum.HumanoidStateType.Running)
+    end
+    root.Velocity = Vector3.new(0, 0, 0)
+    if autoTweenToggle then autoTweenToggle.Text = "OFF" end
+end
+
+local function toggleAutoSpawn(interval)
+    if autoSpawnWaypoints and autoSpawnThread then
+        coroutine.close(autoSpawnThread)
+        autoSpawnThread = nil
+    end
+    if interval > 0 then
+        autoSpawnWaypoints = true
+        spawnInterval = interval
+        if autoSpawnToggle then autoSpawnToggle.Text = "ON" end
+        autoSpawnThread = coroutine.create(function()
+            while autoSpawnWaypoints do
+                addWaypoint()
+                task.wait(spawnInterval)
+            end
+        end)
+        coroutine.resume(autoSpawnThread)
+    else
+        autoSpawnWaypoints = false
+        if autoSpawnToggle then autoSpawnToggle.Text = "OFF" end
+    end
+end
+
+-- ========== Функции Walkspeed и MountainClimber ==========
+local function updateWalkspeed()
+    if wsCon then wsCon:Disconnect() wsCon = nil end
+    if walkspeedEnabled then
+        wsCon = RunService.RenderStepped:Connect(function()
+            if humanoid then
+                humanoid.WalkSpeed = walkspeedValue
+            end
+        end)
+    end
+end
+
+local function updateMountainClimber()
+    if msaCon then msaCon:Disconnect() msaCon = nil end
+    if mountainClimberEnabled then
+        msaCon = RunService.RenderStepped:Connect(function()
+            if humanoid then
+                humanoid.MaxSlopeAngle = 90
+            end
+        end)
+    else
+        if humanoid then
+            humanoid.MaxSlopeAngle = 46
+        end
+    end
+end
+
+-- ========== Создание GUI (уменьшенное в 3 раза) ==========
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "WaypointHub"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = player.PlayerGui
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 140, 0, 187)   -- было 420x560
+mainFrame.Position = UDim2.new(0.5, -70, 0.5, -94) -- -210 -> -70, -280 -> -94
+mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+mainFrame.BackgroundTransparency = 0.05
+mainFrame.BorderSizePixel = 0
+mainFrame.ClipsDescendants = false
+mainFrame.Parent = screenGui
+
+local shadow = Instance.new("Frame")
+shadow.Size = UDim2.new(1, 0, 1, 0)
+shadow.Position = UDim2.new(0, 0, 0, 0)
+shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+shadow.BackgroundTransparency = 0.4
+shadow.BorderSizePixel = 0
+shadow.Parent = mainFrame
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 4)          -- 12 -> 4
+corner.Parent = mainFrame
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 14)        -- 40 -> 14
+titleBar.BackgroundColor3 = Color3.fromRGB(45, 45, 50)
+titleBar.BackgroundTransparency = 0.5
+titleBar.BorderSizePixel = 0
+titleBar.Parent = mainFrame
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 4)      -- 12 -> 4
+titleCorner.Parent = titleBar
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, -4, 1, 0)       -- -10 -> -4
+titleLabel.Position = UDim2.new(0, 3, 0, 0)    -- 10 -> 3
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "Waypoints Hub"
+titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleLabel.TextSize = 10                       -- 20 -> 10
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 10, 0, 10)        -- 30 -> 10
+closeBtn.Position = UDim2.new(1, -12, 0, 2)    -- -35 -> -12, 5 -> 2
+closeBtn.BackgroundColor3 = Color3.fromRGB(255, 70, 70)
+closeBtn.BackgroundTransparency = 0.3
+closeBtn.BorderSizePixel = 0
+closeBtn.Text = "X"
+closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+closeBtn.TextSize = 8                          -- 18 -> 8
+closeBtn.Font = Enum.Font.GothamBold
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 2)      -- 6 -> 2
+closeCorner.Parent = closeBtn
+closeBtn.Parent = titleBar
+closeBtn.MouseButton1Click:Connect(function()
+    screenGui:Destroy()
+end)
+
+-- Перетаскивание
+local dragging = false
+local dragStart, startPos
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = mainFrame.Position
+    end
+end)
+titleBar.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+        mainFrame.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+-- Панель вкладок
+local tabPanel = Instance.new("Frame")
+tabPanel.Size = UDim2.new(1, 0, 0, 12)         -- 36 -> 12
+tabPanel.Position = UDim2.new(0, 0, 0, 14)     -- 40 -> 14
+tabPanel.BackgroundTransparency = 1
+tabPanel.Parent = mainFrame
+
+local function createTabButton(text, parent)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.5, 0, 1, 0)
+    btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+    btn.BackgroundTransparency = 0.2
+    btn.BorderSizePixel = 0
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    btn.TextSize = 8                           -- 16 -> 8
+    btn.Font = Enum.Font.GothamBold
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 2)       -- 6 -> 2
+    corner.Parent = btn
+    btn.Parent = parent
+    return btn
+end
+
+local tabWaypointsBtn = createTabButton("Waypoints", tabPanel)
+tabWaypointsBtn.Position = UDim2.new(0, 1, 0, 0)  -- 2 -> 1
+local tabMainBtn = createTabButton("Main", tabPanel)
+tabMainBtn.Position = UDim2.new(0.5, 0, 0, 0)
+
+local contentContainer = Instance.new("Frame")
+contentContainer.Size = UDim2.new(1, -4, 1, -30)   -- -10 -> -4, -90 -> -30
+contentContainer.Position = UDim2.new(0, 2, 0, 27) -- 5->2, 80->27
+contentContainer.BackgroundTransparency = 1
+contentContainer.Parent = mainFrame
+
+-- Вкладка Waypoints
+local waypointsTab = Instance.new("ScrollingFrame")
+waypointsTab.Size = UDim2.new(1, 0, 1, 0)
+waypointsTab.BackgroundTransparency = 1
+waypointsTab.BorderSizePixel = 0
+waypointsTab.ScrollBarThickness = 2            -- 4 -> 2
+waypointsTab.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 120)
+waypointsTab.CanvasSize = UDim2.new(0, 0, 0, 0)
+waypointsTab.AutomaticCanvasSize = Enum.AutomaticSize.Y
+waypointsTab.Parent = contentContainer
+
+-- Вкладка Main
+local mainTab = Instance.new("ScrollingFrame")
+mainTab.Size = UDim2.new(1, 0, 1, 0)
+mainTab.BackgroundTransparency = 1
+mainTab.BorderSizePixel = 0
+mainTab.ScrollBarThickness = 2
+mainTab.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 120)
+mainTab.CanvasSize = UDim2.new(0, 0, 0, 0)
+mainTab.AutomaticCanvasSize = Enum.AutomaticSize.Y
+mainTab.Parent = contentContainer
+mainTab.Visible = false
+
+tabWaypointsBtn.MouseButton1Click:Connect(function()
+    waypointsTab.Visible = true
+    mainTab.Visible = false
+    tabWaypointsBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
+    tabMainBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+end)
+tabMainBtn.MouseButton1Click:Connect(function()
+    waypointsTab.Visible = false
+    mainTab.Visible = true
+    tabMainBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
+    tabWaypointsBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+end)
+tabWaypointsBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
+
+-- ========== Создание элементов управления (уменьшенные) ==========
+local function createLabel(text, parent, yPos)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -4, 0, 7)           -- -10 -> -4, 20 -> 7
+    lbl.Position = UDim2.new(0, 2, 0, yPos)     -- 5 -> 2
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+    lbl.TextSize = 8                           -- 14 -> 8
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = parent
+    return lbl
+end
+
+local function createButton(text, parent, yPos, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.9, 0, 0, 11)         -- 32 -> 11
+    btn.Position = UDim2.new(0.05, 0, 0, yPos)
+    btn.BackgroundColor3 = Color3.fromRGB(70, 70, 85)
+    btn.BackgroundTransparency = 0.1
+    btn.BorderSizePixel = 0
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    btn.TextSize = 8                           -- 14 -> 8
+    btn.Font = Enum.Font.GothamBold
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 2)       -- 6 -> 2
+    corner.Parent = btn
+    btn.Parent = parent
+    btn.MouseButton1Click:Connect(callback)
+    return btn
+end
+
+local function createToggleButton(text, parent, yPos, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.9, 0, 0, 11)         -- 32 -> 11
+    btn.Position = UDim2.new(0.05, 0, 0, yPos)
+    btn.BackgroundColor3 = Color3.fromRGB(70, 70, 85)
+    btn.BackgroundTransparency = 0.1
+    btn.BorderSizePixel = 0
+    btn.Text = text .. " OFF"
+    btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    btn.TextSize = 8                           -- 14 -> 8
+    btn.Font = Enum.Font.GothamBold
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 2)       -- 6 -> 2
+    corner.Parent = btn
+    btn.Parent = parent
+    local state = false
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        btn.Text = text .. (state and " ON" or " OFF")
+        callback(state)
+    end)
+    return btn
+end
+
+local function createSliderWithLabel(labelText, parent, yPos, minVal, maxVal, defaultVal, step, callback)
+    local lbl = createLabel(labelText, parent, yPos)
+    local valueDisplay = Instance.new("TextLabel")
+    valueDisplay.Size = UDim2.new(0.2, 0, 0, 7)   -- 20 -> 7
+    valueDisplay.Position = UDim2.new(0.75, 0, 0, yPos)
+    valueDisplay.BackgroundTransparency = 1
+    valueDisplay.Text = tostring(defaultVal)
+    valueDisplay.TextColor3 = Color3.fromRGB(255, 255, 255)
+    valueDisplay.TextSize = 8                   -- 14 -> 8
+    valueDisplay.Font = Enum.Font.GothamBold
+    valueDisplay.TextXAlignment = Enum.TextXAlignment.Right
+    valueDisplay.Parent = parent
+
+    local sliderFrame = Instance.new("Frame")
+    sliderFrame.Size = UDim2.new(0.7, 0, 0, 3)   -- 8 -> 3
+    sliderFrame.Position = UDim2.new(0.05, 0, 0, yPos + 8) -- 24 -> 8
+    sliderFrame.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
+    sliderFrame.BorderSizePixel = 0
+    local sliderCorner = Instance.new("UICorner")
+    sliderCorner.CornerRadius = UDim.new(0, 2)    -- 4 -> 2
+    sliderCorner.Parent = sliderFrame
+    sliderFrame.Parent = parent
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((defaultVal - minVal) / (maxVal - minVal), 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(100, 200, 255)
+    fill.BorderSizePixel = 0
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(0, 2)      -- 4 -> 2
+    fillCorner.Parent = fill
+    fill.Parent = sliderFrame
+
+    local sliderBtn = Instance.new("TextButton")
+    sliderBtn.Size = UDim2.new(0, 5, 0, 5)        -- 16 -> 5
+    sliderBtn.Position = UDim2.new((defaultVal - minVal) / (maxVal - minVal), -3, 0.5, -3) -- -8 -> -3
+    sliderBtn.BackgroundColor3 = Color3.fromRGB(200, 200, 210)
+    sliderBtn.BorderSizePixel = 0
+    sliderBtn.Text = ""
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 3)       -- 8 -> 3
+    btnCorner.Parent = sliderBtn
+    sliderBtn.Parent = sliderFrame
+
+    local draggingSlider = false
+    sliderBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            draggingSlider = true
+        end
+    end)
+    sliderBtn.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            draggingSlider = false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if draggingSlider and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local absX, absY = sliderFrame.AbsolutePosition.X, sliderFrame.AbsolutePosition.Y
+            local mouseX = input.Position.X
+            local relX = math.clamp((mouseX - absX) / sliderFrame.AbsoluteSize.X, 0, 1)
+            local val = minVal + relX * (maxVal - minVal)
+            val = math.round(val / step) * step
+            val = math.clamp(val, minVal, maxVal)
+            fill.Size = UDim2.new(relX, 0, 1, 0)
+            sliderBtn.Position = UDim2.new(relX, -3, 0.5, -3)
+            valueDisplay.Text = tostring(val)
+            callback(val)
+        end
+    end)
+
+    return { setValue = function(newVal)
+        newVal = math.clamp(newVal, minVal, maxVal)
+        local relX = (newVal - minVal) / (maxVal - minVal)
+        fill.Size = UDim2.new(relX, 0, 1, 0)
+        sliderBtn.Position = UDim2.new(relX, -3, 0.5, -3)
+        valueDisplay.Text = tostring(newVal)
+    end}
+end
+
+local function createInputField(placeholder, parent, yPos, callback)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(0.9, 0, 0, 9)          -- 28 -> 9
+    box.Position = UDim2.new(0.05, 0, 0, yPos)
+    box.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    box.BackgroundTransparency = 0.3
+    box.BorderSizePixel = 0
+    box.PlaceholderText = placeholder
+    box.Text = ""
+    box.TextColor3 = Color3.fromRGB(220, 220, 220)
+    box.TextSize = 8                           -- 14 -> 8
+    box.Font = Enum.Font.Gotham
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 2)       -- 4 -> 2
+    corner.Parent = box
+    box.Parent = parent
+    box.FocusLost:Connect(function(enterPressed)
+        if enterPressed then
+            callback(box.Text)
+            box.Text = ""
+        end
+    end)
+    return box
+end
+
+-- ===== Сборка элементов Waypoints =====
+local wy = waypointsTab
+local yPos = 2                                 -- было 5
+
+createButton("Add Waypoint", wy, yPos, addWaypoint)
+yPos = yPos + 13                               -- 38 -> 13
+createButton("Remove All", wy, yPos, removeAllWaypoints)
+yPos = yPos + 13
+createButton("Remove Last", wy, yPos, removeLastWaypoint)
+yPos = yPos + 13
+createButton("Generate 20 Random", wy, yPos, generateRandomWaypoints)
+yPos = yPos + 13
+
+createLabel("Manage WP (enter #):", wy, yPos)
+yPos = yPos + 7                                -- 22 -> 7
+local manageInput = createInputField("Waypoint number", wy, yPos, function(val)
+    local num = tonumber(val)
+    if num then manageWaypoint(num) end
+end)
+yPos = yPos + 11                               -- 34 -> 11
+createButton("Unmanage WP", wy, yPos, unmanageWaypoint)
+yPos = yPos + 13
+
+createLabel("Set Wait Time:", wy, yPos)
+yPos = yPos + 7
+local waitIndexInput = createInputField("Waypoint number", wy, yPos, function() end)
+yPos = yPos + 11
+local waitTimeInput = createInputField("Wait time (s)", wy, yPos, function() end)
+yPos = yPos + 11
+createButton("Set Wait Time", wy, yPos, function()
+    local idx = tonumber(waitIndexInput.Text)
+    local wt = tonumber(waitTimeInput.Text)
+    if idx and wt then
+        setWaitTime(idx, wt)
+        waitIndexInput.Text = ""
+        waitTimeInput.Text = ""
+    end
+end)
+yPos = yPos + 13
+
+createButton("📋 Copy All", wy, yPos, copyWaypoints)
+yPos = yPos + 13
+createLabel("Paste data (JSON/Lua):", wy, yPos)
+yPos = yPos + 7
+local pasteBox = Instance.new("TextBox")
+pasteBox.Size = UDim2.new(0.9, 0, 0, 20)       -- 60 -> 20
+pasteBox.Position = UDim2.new(0.05, 0, 0, yPos)
+pasteBox.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+pasteBox.BackgroundTransparency = 0.3
+pasteBox.BorderSizePixel = 0
+pasteBox.PlaceholderText = "Paste JSON or Lua code here..."
+pasteBox.Text = ""
+pasteBox.TextColor3 = Color3.fromRGB(220, 220, 220)
+pasteBox.TextSize = 8                          -- 14 -> 8
+pasteBox.Font = Enum.Font.Gotham
+pasteBox.TextWrapped = true
+pasteBox.TextXAlignment = Enum.TextXAlignment.Left
+pasteBox.TextYAlignment = Enum.TextYAlignment.Top
+local cornerBox = Instance.new("UICorner")
+cornerBox.CornerRadius = UDim.new(0, 2)       -- 4 -> 2
+cornerBox.Parent = pasteBox
+pasteBox.Parent = wy
+yPos = yPos + 22                               -- 66 -> 22
+createButton("Load Waypoints", wy, yPos, function()
+    if pasteBox.Text ~= "" then
+        loadWaypointsFromString(pasteBox.Text)
+        pasteBox.Text = ""
+    end
+end)
+yPos = yPos + 13
+
+autoTweenToggle = createToggleButton("Auto Tween", wy, yPos, function(state)
+    if state then
+        startAutoWalk()
+    else
+        stopAutoWalk()
+    end
+end)
+yPos = yPos + 13
+local tweenSpeedSlider = createSliderWithLabel("Tween Speed", wy, yPos, 10, 32, 20, 1, function(val)
+    tweenSpeed = val
+end)
+yPos = yPos + 17                               -- 50 -> 17
+
+autoSpawnToggle = createToggleButton("Auto Spawn", wy, yPos, function(state)
+    toggleAutoSpawn(state and spawnInterval or 0)
+end)
+yPos = yPos + 13
+local spawnIntervalSlider = createSliderWithLabel("Spawn Interval (s)", wy, yPos, 0.05, 5, 0.5, 0.05, function(val)
+    spawnInterval = val
+    if autoSpawnWaypoints then
+        toggleAutoSpawn(spawnInterval)
+    end
+end)
+yPos = yPos + 17
+
+-- ===== Элементы Main (Walkspeed, MountainClimber) =====
+local mt = mainTab
+yPos = 2
+
+local wsToggleBtn = createToggleButton("Walkspeed", mt, yPos, function(state)
+    walkspeedEnabled = state
+    updateWalkspeed()
+end)
+yPos = yPos + 13
+local wsSlider = createSliderWithLabel("Walkspeed Value", mt, yPos, 16, 21, 16, 1, function(val)
+    walkspeedValue = val
+    if walkspeedEnabled then updateWalkspeed() end
+end)
+yPos = yPos + 17
+
+createToggleButton("Mountain Climber", mt, yPos, function(state)
+    mountainClimberEnabled = state
+    updateMountainClimber()
+end)
+
+-- ========== Инициализация ==========
+notify("Waypoint Hub", "Loaded successfully!", 3)
+
+player.CharacterAdded:Connect(function(newChar)
+    task.wait(0.5)
+    character = newChar
+    root = character:WaitForChild("HumanoidRootPart")
+    humanoid = character:WaitForChild("Humanoid")
+    if running then
+        stopAutoWalk()
+        if autoTweenToggle then autoTweenToggle.Text = "OFF" end
+    end
+    updateWalkspeed()
+    updateMountainClimber()
+end)
+
+game:BindToClose(function()
+    if running then stopAutoWalk() end
+    if autoSpawnWaypoints then toggleAutoSpawn(0) end
+end)
+
+Players.LocalPlayer.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
